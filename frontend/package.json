@@ -8,6 +8,7 @@
     "dev": "vite --host --port 22809",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "verify:merge": "esbuild scripts/verify-merge.ts --bundle --platform=node --format=esm --outfile=node_modules/.verify-merge.mjs --log-level=warning && node node_modules/.verify-merge.mjs",
     "preview": "vite preview --host --port 22809"
   },
   "dependencies": {
@@ -23,6 +24,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^6.1.0"
   }

@@ -96,6 +96,29 @@ export function judgeReading(value: number, min: number, max: number, isCritical
   }
 }
 
+/**
+ * 按读数「录入时冻结的标准快照」取判级。
+ * 标准值后续被修改也不影响历史读数：页面展示历史判级一律走此函数。
+ */
+export interface FrozenStandard {
+  deviationPct: number
+  isCriticalAtEntry: boolean
+}
+
+export function levelOfReading(reading: FrozenStandard): AbnormalLevel {
+  return abnormalLevelOf(reading.deviationPct, reading.isCriticalAtEntry)
+}
+
+/** 现场值与外检原值的差异是否构成冲突（值不同即保留两版） */
+export function isValueConflict(a: number, b: number): boolean {
+  return Number.isFinite(a) && Number.isFinite(b) && a !== b
+}
+
+/** 外检浓度与处置单记载浓度的差异（ppm） */
+export function concentrationGapPpm(external: number, leakPpm: number): number {
+  return Math.abs(external - leakPpm)
+}
+
 export function rangeText(min: number, max: number, unit: string): string {
   return `${min} ~ ${max} ${unit}`
 }

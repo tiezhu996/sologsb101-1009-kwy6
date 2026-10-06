@@ -4,7 +4,9 @@
  * 消费 Leak、Device、Reading；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<AbnormalTag>。
  */
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
+  Alert,
   Button,
   Form,
   Input,
@@ -23,11 +25,13 @@ import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { useLeakStore } from '@/stores/leakStore'
+import { useSyncStore } from '@/stores/syncStore'
 import {
   EMPTY_LEAK_DRAFT,
   LEAK_RETEST_PASS_PPM,
   LEAK_STATES,
   LEAK_STATE_FLOW,
+  isLeakBlocked,
   retestPassed,
   type Leak,
   type LeakDraft,
@@ -36,8 +40,10 @@ import {
 import { deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
 export default function LeakBoard() {
+  const navigate = useNavigate()
   const stationStore = useStationStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
 
   const [form] = Form.useForm<LeakDraft>()
   const [treatForm] = Form.useForm<{ handler: string; measure: string }>()
@@ -135,6 +141,10 @@ export default function LeakBoard() {
   }
 
   const advance = async (leak: Leak): Promise<void> => {
+    if (isLeakBlocked(leak)) {
+      Message.error('外检值与处置单存在未决冲突，负责人裁决前不能继续处置 / 完成')
+      return
+    }
     const next = LEAK_STATE_FLOW[leak.state]
     if (!next) {
       Message.info('该处置单已完成复检闭环')
@@ -155,7 +165,12 @@ export default function LeakBoard() {
     if (!target) return
     const values = await treatForm.validate().catch(() => null)
     if (!values) return
-    await leakStore.advance(target.id, { handler: values.handler, measure: values.measure })
+    const result = await leakStore.advance(target.id, { handler: values.handler, measure: values.measure })
+    if (result && typeof result === 'object' && 'blocked' in result) {
+      Message.error('处置单被未决冲突拦截，请先到「合并与冲突」页裁决')
+      setTreatOpen(false)
+      return
+    }
     Message.success('处置措施已归档，状态置为「已处置」')
     setTreatOpen(false)
   }
@@ -164,7 +179,13 @@ export default function LeakBoard() {
     if (!target) return
     const values = await retestForm.validate().catch(() => null)
     if (!values) return
-    const passed = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler)
+    const result = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler)
+    if (typeof result === 'object' && result !== null && 'blocked' in result) {
+      Message.error('复检闭环被未决冲突拦截：请由负责人先选择事实来源')
+      setRetestOpen(false)
+      return
+    }
+    const passed = result as boolean
     if (passed) {
       Message.success(`复检浓度 ${values.retestValuePpm} ppm ≤ ${LEAK_RETEST_PASS_PPM} ppm，判定合格，处置单已闭环`)
     } else {
@@ -205,6 +226,23 @@ export default function LeakBoard() {
       )
     },
     {
+      title: '冲突拦截',
+      width: 150,
+      render: (_value, record) =>
+        isLeakBlocked(record) ? (
+          <Space size={4}>
+            <Tag color="red" size="small">冲突未决</Tag>
+            <Button type="text" size="small" onClick={() => navigate('/sync')}>
+              去裁决
+            </Button>
+          </Space>
+        ) : record.factReadingId ? (
+          <Tag color="arcoblue" size="small">已按裁决浓度</Tag>
+        ) : (
+          <span className="muted">无</span>
+        )
+    },
+    {
       title: '复检值',
       width: 160,
       render: (_value, record) => {
@@ -222,11 +260,22 @@ export default function LeakBoard() {
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
     {
       title: '操作',
-      width: 240,
+      width: 260,
       render: (_value, record) => (
         <Space size={4}>
-          <Button type="text" size="small" disabled={!LEAK_STATE_FLOW[record.state]} onClick={() => advance(record)}>
-            {LEAK_STATE_FLOW[record.state] === '已处置' ? '填写措施' : LEAK_STATE_FLOW[record.state] === '已复检' ? '录入复检' : '已闭环'}
+          <Button
+            type="text"
+            size="small"
+            disabled={!LEAK_STATE_FLOW[record.state] || isLeakBlocked(record)}
+            onClick={() => advance(record)}
+          >
+            {isLeakBlocked(record)
+              ? '冲突未决'
+              : LEAK_STATE_FLOW[record.state] === '已处置'
+                ? '填写措施'
+                : LEAK_STATE_FLOW[record.state] === '已复检'
+                  ? '录入复检'
+                  : '已闭环'}
           </Button>
           <Button type="text" size="small" onClick={() => openEdit(record)}>
             编辑
@@ -242,6 +291,7 @@ export default function LeakBoard() {
   ]
 
   const stats = leakStore.counts()
+  const blockedCount = leakStore.leaks.filter((leak) => isLeakBlocked(leak)).length
 
   return (
     <div>
@@ -271,7 +321,21 @@ export default function LeakBoard() {
         <StatBadge label="待处置" value={stats['待处置']} suffix="张" tone="danger" />
         <StatBadge label="已处置" value={stats['已处置']} suffix="张" tone="warning" />
         <StatBadge label="复检合格" value={leakStore.retestPassCount()} percent={leakStore.closedPercent()} suffix="张" tone="success" />
+        <StatBadge label="冲突拦截中" value={blockedCount} suffix="张" tone="danger" hint="外检值与处置单冲突未裁决，不能完成闭环" />
       </div>
+
+      {blockedCount > 0 ? (
+        <Alert
+          type="error"
+          style={{ marginBottom: 12 }}
+          content={`有 ${blockedCount} 张处置单因外检值与记载浓度冲突被拦截：差异已保留，需负责人在「合并与冲突」页选择事实来源，裁决前不能填写措施 / 录入复检 / 完成。`}
+          action={
+            <Button size="small" type="primary" onClick={() => navigate('/sync')}>
+              前往裁决（{syncStore.openConflicts().length} 条未决）
+            </Button>
+          }
+        />
+      ) : null}
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索设备型号 / 编号 / 处置人" onModelChange={onModelChange} />
 
@@ -300,7 +364,7 @@ export default function LeakBoard() {
             data={rows}
             columns={columns}
             pagination={false}
-            scroll={{ x: 1500 }}
+            scroll={{ x: 1750 }}
           />
         )}
       </div>

@@ -21,12 +21,14 @@ import type { TableColumnProps } from '@arco-design/web-react'
 import AbnormalTag from '@/components/common/AbnormalTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
+import SourceTag from '@/components/common/SourceTag'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { usePatrolStore, type AbnormalRow } from '@/stores/patrolStore'
 import { useLeakStore } from '@/stores/leakStore'
+import { useSyncStore } from '@/stores/syncStore'
 import type { AbnormalLevel } from '@/utils/range'
-import { CRITICAL_DEVIATION_PCT, SEVERE_DEVIATION_PCT } from '@/utils/range'
+import { CRITICAL_DEVIATION_PCT, levelOfReading, SEVERE_DEVIATION_PCT } from '@/utils/range'
 
 const LEVELS: AbnormalLevel[] = ['轻微超标', '严重超标']
 
@@ -35,6 +37,7 @@ export default function AbnormalBoard() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
 
   const [stationId, setStationId] = useState('')
   const [levels, setLevels] = useState<AbnormalLevel[]>([])
@@ -95,7 +98,13 @@ export default function AbnormalBoard() {
       Message.success('已派发泄漏处置单')
       return
     }
-    await patrolStore.saveSingleReading(row.reading.patrolId, point, row.reading.value, '异常已确认并记录')
+    await patrolStore.saveSingleReading(
+      row.reading.patrolId,
+      point,
+      row.reading.value,
+      '异常已确认并记录',
+      row.reading.source
+    )
     Message.success('异常已确认并记录')
   }
 
@@ -119,7 +128,13 @@ export default function AbnormalBoard() {
         })
         leakCount += 1
       } else {
-        await patrolStore.saveSingleReading(row.reading.patrolId, row.point, row.reading.value, '异常已批量确认')
+        await patrolStore.saveSingleReading(
+          row.reading.patrolId,
+          row.point,
+          row.reading.value,
+          '异常已批量确认',
+          row.reading.source
+        )
         notedCount += 1
       }
     }
@@ -141,9 +156,10 @@ export default function AbnormalBoard() {
       fixTarget.reading.patrolId,
       fixTarget.point,
       Number(values.value),
-      values.note
+      values.note,
+      fixTarget.reading.source
     )
-    Message.success('读数已修正，偏差率与异常级别已重算')
+    Message.success('读数已按当前标准重新判级（仅影响该读数所属批次，历史判级不回翻）')
     setFixOpen(false)
   }
 
@@ -197,7 +213,26 @@ export default function AbnormalBoard() {
       title: '判定',
       width: 170,
       render: (_value, record) => (
-        <AbnormalTag level={record.level} deviationPct={record.reading.deviationPct} size="small" />
+        <AbnormalTag level={levelOfReading(record.reading)} deviationPct={record.reading.deviationPct} size="small" />
+      )
+    },
+    {
+      title: '来源 / 标准版本',
+      width: 250,
+      render: (_value, record) => (
+        <Space direction="vertical" size={2}>
+          <SourceTag
+            source={record.reading.source}
+            syncState={record.reading.syncState}
+            verifyState={record.reading.verifyState}
+          />
+          <span className="muted">
+            按录入时 v{record.reading.standardRevision} 标准
+            {record.point && record.point.standardRevision !== record.reading.standardRevision
+              ? `（现行 v${record.point.standardRevision}，历史不翻案）`
+              : ''}
+          </span>
+        </Space>
       )
     },
     {
@@ -258,6 +293,7 @@ export default function AbnormalBoard() {
         <StatBadge label="严重超标" value={rows.filter((row) => row.level === '严重超标').length} suffix="条" tone="danger" />
         <StatBadge label="泄漏类异常" value={leakConcentrationRows.length} suffix="条" tone="info" />
         <StatBadge label="待处置泄漏单" value={leakStore.counts()['待处置']} suffix="张" tone="default" />
+        <StatBadge label="卷入未决冲突" value={rows.filter((row) => syncStore.conflictOf(row.reading.conflictId)?.status === 'open').length} suffix="条" tone="danger" />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="" onModelChange={onModelChange} />
@@ -285,7 +321,7 @@ export default function AbnormalBoard() {
             data={rows}
             columns={columns}
             pagination={false}
-            scroll={{ x: 1600 }}
+            scroll={{ x: 1880 }}
             rowSelection={{
               selectedRowKeys: selectedKeys,
               onChange: (keys: (string | number)[]) => setSelectedKeys(keys.map((key) => String(key)))

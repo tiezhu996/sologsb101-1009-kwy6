@@ -15,6 +15,13 @@ export interface Leak {
   /** 复检浓度（ppm） */
   retestValuePpm: number
   handler: string
+  /**
+   * 未决冲突 id：外检值与本处置单冲突且尚未由负责人裁决时回填。
+   * 非空期间处置单不能完成闭环（advance / 复检提交均被拦截）。
+   */
+  blockedByConflict: string
+  /** 负责人裁决选定的事实来源读数（裁决后回填，空串表示未裁决） */
+  factReadingId: string
   createdAt: number
   updatedAt: number
 }
@@ -49,6 +56,10 @@ export const EMPTY_LEAK_DRAFT: LeakDraft = {
   state: '待处置',
   retestValuePpm: 0,
   handler: ''
+}
+
+export function isLeakBlocked(leak: Pick<Leak, 'blockedByConflict'>): boolean {
+  return typeof leak.blockedByConflict === 'string' && leak.blockedByConflict.length > 0
 }
 
 export function createEmptyLeakDraft(): LeakDraft {

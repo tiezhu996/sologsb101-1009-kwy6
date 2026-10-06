@@ -7,6 +7,7 @@ import { ROUTES } from './router'
 import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
+import { useSyncStore } from './stores/syncStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
 
 export default function App() {
@@ -15,9 +16,11 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
+  const openConflictCount = syncStore.openConflicts().length
 
   const navItems = [
     { path: ROUTES.stations, label: '调压站台账', count: stationStore.stations.length },
@@ -25,6 +28,7 @@ export default function App() {
     { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
     { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
+    { path: ROUTES.sync, label: '合并与冲突', count: openConflictCount + syncStore.pendingReadings.length },
     { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
   ]
 
@@ -79,6 +83,14 @@ export default function App() {
             )}
           </Space>
           <Space size={8} wrap>
+            <Tag color={syncStore.offline ? 'orange' : 'green'}>
+              {syncStore.offline ? '现场断网 · 本地暂存' : '网络正常'}
+            </Tag>
+            {openConflictCount > 0 ? (
+              <Tag color="red" style={{ cursor: 'pointer' }} onClick={() => navigate(ROUTES.sync)}>
+                {openConflictCount} 条冲突未决
+              </Tag>
+            ) : null}
             <Badge count={leakStore.counts()['待处置']} dotStyle={{ background: '#f53f3f' }} />
             <Button size="small" onClick={() => navigate(ROUTES.stations)}>
               调压站台账

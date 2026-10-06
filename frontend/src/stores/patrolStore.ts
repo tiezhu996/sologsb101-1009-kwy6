@@ -1,6 +1,9 @@
 /**
  * 巡检任务与读数状态（Zustand）
  * 维护巡检任务列表、读数草稿与异常判定结果。
+ * 读数区分巡检班（现场）/ 外检班（外检原值）来源：
+ * - 现场断网时先落「本地暂存」，恢复后由 syncStore 触发按设备+点位合并；
+ * - 判级永远取读数录入时冻结的标准快照，标准后续修改不翻历史。
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
@@ -9,9 +12,12 @@ import type { Patrol, PatrolDraft, PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
 import type { ReadingDraftMap } from '@/types/reading'
+import type { ReadingSource } from '@/types/source'
 import type { AbnormalLevel, ReadingJudgement } from '@/utils/range'
-import { abnormalLevelOf, abnormalWeight, judgeReading } from '@/utils/range'
+import { abnormalLevelOf, abnormalWeight, judgeReading, levelOfReading } from '@/utils/range'
+import { mergePendingReadings } from '@/utils/merge'
 import { useStationStore } from '@/stores/stationStore'
+import { useSyncStore } from '@/stores/syncStore'
 
 export interface AbnormalRow {
   reading: Reading
@@ -24,13 +30,16 @@ export interface AbnormalRow {
 interface PatrolState_ {
   patrols: Patrol[]
   readings: Reading[]
-  /** 读数草稿：`${patrolId}:${pointId}` → 输入值 */
+  /** 读数草稿：`${patrolId}:${pointId}:${source}` → 输入值 */
   readingDraft: ReadingDraftMap
   /** 当前正在录入的巡检 id */
   activePatrolId: string | null
+  /** 当前录入班组 */
+  entrySource: ReadingSource
   filter: { stationId: string; states: PatrolState[] }
   ready: boolean
   setActivePatrol: (id: string | null) => void
+  setEntrySource: (source: ReadingSource) => void
   patchFilter: (patch: { stationId?: string; states?: PatrolState[] }) => void
   resetFilter: () => void
   createPatrol: (draft: PatrolDraft) => Promise<Patrol>
@@ -39,17 +48,24 @@ interface PatrolState_ {
   generatePlans: (stationIds: string[], planDate: string, patrolman: string) => Promise<number>
   markMissed: (id: string, note: string) => Promise<void>
   completePatrol: (id: string, patrolDate: string, patrolman: string, envNote: string) => Promise<void>
-  setReadingDraft: (patrolId: string, pointId: string, value: number) => void
+  draftKey: (patrolId: string, pointId: string, source?: ReadingSource) => string
+  setReadingDraft: (patrolId: string, pointId: string, value: number, source?: ReadingSource) => void
   clearReadingDraft: (patrolId?: string) => void
   seedDraftFromReadings: (patrolId: string, points: Point[]) => void
-  saveReadingDrafts: (patrolId: string, points: Point[]) => Promise<number>
-  saveSingleReading: (patrolId: string, point: Point, value: number, note: string) => Promise<void>
+  saveReadingDrafts: (patrolId: string, points: Point[], source?: ReadingSource) => Promise<number>
+  saveSingleReading: (
+    patrolId: string,
+    point: Point,
+    value: number,
+    note: string,
+    source?: ReadingSource
+  ) => Promise<ReadingRow>
   removeReading: (id: string) => Promise<void>
   judge: (point: Point, value: number) => ReadingJudgement
   readingsOfPatrol: (patrolId: string) => Reading[]
   abnormalRows: () => AbnormalRow[]
   filteredPatrols: () => Patrol[]
-  pointValuesOf: (patrolId: string) => Map<string, Reading>
+  pointValuesOf: (patrolId: string) => Map<string, Reading[]>
 }
 
 export const usePatrolStore = create<PatrolState_>((set, get) => ({
@@ -57,11 +73,20 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   readings: [],
   readingDraft: {},
   activePatrolId: null,
+  entrySource: 'site',
   filter: { stationId: '', states: [] },
   ready: false,
 
   setActivePatrol(id) {
     set({ activePatrolId: id })
+  },
+
+  setEntrySource(source) {
+    set({ entrySource: source })
+  },
+
+  draftKey(patrolId, pointId, source) {
+    return `${patrolId}:${pointId}:${source ?? get().entrySource}`
   },
 
   patchFilter(patch) {
@@ -141,8 +166,9 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     })
   },
 
-  setReadingDraft(patrolId, pointId, value) {
-    set({ readingDraft: { ...get().readingDraft, [`${patrolId}:${pointId}`]: value } })
+  setReadingDraft(patrolId, pointId, value, source) {
+    const key = get().draftKey(patrolId, pointId, source)
+    set({ readingDraft: { ...get().readingDraft, [key]: value } })
   },
 
   clearReadingDraft(patrolId) {
@@ -161,53 +187,79 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
     const next = { ...get().readingDraft }
     const existing = get().readings.filter((reading) => reading.patrolId === patrolId)
     points.forEach((point) => {
-      const key = `${patrolId}:${point.id}`
-      if (next[key] !== undefined) return
-      const found = existing.find((reading) => reading.pointId === point.id)
-      if (found) next[key] = found.value
+      ;(['site', 'external'] as ReadingSource[]).forEach((source) => {
+        const key = get().draftKey(patrolId, point.id, source)
+        if (next[key] !== undefined) return
+        const found = existing
+          .filter((reading) => reading.pointId === point.id && reading.source === source)
+          .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+        if (found) next[key] = found.value
+      })
     })
     set({ readingDraft: next })
   },
 
-  async saveReadingDrafts(patrolId, points) {
+  async saveReadingDrafts(patrolId, points, sourceArg) {
+    const source = sourceArg ?? get().entrySource
     const draft = get().readingDraft
-    const existing = get().readings.filter((reading) => reading.patrolId === patrolId)
+    // 同班组同点位只保留一条（重复录入覆盖最新值）；另一班组的值不互相覆盖
+    const existing = get().readings.filter(
+      (reading) => reading.patrolId === patrolId && reading.source === source
+    )
     const now = Date.now()
-    const payload: ReadingRow[] = []
-    points.forEach((point) => {
-      const key = `${patrolId}:${point.id}`
+    const offline = useSyncStore.getState().offline
+    const queuedIds: string[] = []
+    for (const point of points) {
+      const key = get().draftKey(patrolId, point.id, source)
       const value = draft[key]
-      if (value === undefined || !Number.isFinite(value)) return
+      if (value === undefined || !Number.isFinite(value)) continue
       const found = existing.find((reading) => reading.pointId === point.id)
-      const judgement = judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
-      payload.push({
+      // 先落「暂存」：断网时停留 local；在线时立即送合并引擎按设备+点位合并
+      const saved = await putReading({
         id: found ? found.id : createId('rd'),
         patrolId,
         pointId: point.id,
         value,
-        isAbnormal: judgement.isAbnormal,
-        deviationPct: judgement.deviationPct,
         note: found ? found.note : '',
+        source,
+        syncState: 'local',
+        verifyState: source === 'site' ? 'pending' : 'none',
         createdAt: found ? found.createdAt : now,
         updatedAt: now
       })
-    })
-    if (payload.length > 0) await db.readings.bulkPut(payload)
-    return payload.length
+      queuedIds.push(saved.id)
+    }
+    if (!offline && queuedIds.length > 0) {
+      await mergePendingReadings(queuedIds)
+    }
+    return queuedIds.length
   },
 
-  async saveSingleReading(patrolId, point, value, note) {
+  async saveSingleReading(patrolId, point, value, note, sourceArg) {
+    const source = sourceArg ?? get().entrySource
     const now = Date.now()
-    const found = get().readings.find((reading) => reading.patrolId === patrolId && reading.pointId === point.id)
-    await putReading({
+    const offline = useSyncStore.getState().offline
+    const found = get().readings.find(
+      (reading) =>
+        reading.patrolId === patrolId && reading.pointId === point.id && reading.source === source
+    )
+    // 先暂存再合并：在线时当场合并（含双值/处置单冲突检测），断网时停留本地队列
+    const saved = await putReading({
       id: found ? found.id : createId('rd'),
       patrolId,
       pointId: point.id,
       value,
       note,
+      source,
+      syncState: 'local',
+      verifyState: source === 'site' ? 'pending' : 'none',
       createdAt: found ? found.createdAt : now,
       updatedAt: now
     })
+    if (!offline) {
+      await mergePendingReadings([saved.id])
+    }
+    return saved
   },
 
   async removeReading(id) {
@@ -215,6 +267,7 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   },
 
   judge(point, value) {
+    // 草稿态尚无冻结快照，按当前标准实时判级；保存落库时冻结
     return judgeReading(value, point.standardMin, point.standardMax, point.isCritical)
   },
 
@@ -229,15 +282,14 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
       .map((reading) => {
         const point = points.find((item) => item.id === reading.pointId) ?? null
         const patrol = get().patrols.find((item) => item.id === reading.patrolId) ?? null
-        const level: AbnormalLevel = point
-          ? abnormalLevelOf(reading.deviationPct, point.isCritical)
-          : '轻微超标'
+        // 历史判级：以读数录入时冻结的标准为准，标准后来改过也不翻案
+        const level: AbnormalLevel = levelOfReading(reading)
         return {
           reading,
           patrol,
           point,
           level,
-          weight: point ? abnormalWeight(level, point.isCritical) : 20
+          weight: point ? abnormalWeight(level, reading.isCriticalAtEntry) : 20
         }
       })
       .sort((a, b) => b.weight - a.weight || b.reading.deviationPct - a.reading.deviationPct)
@@ -255,10 +307,14 @@ export const usePatrolStore = create<PatrolState_>((set, get) => ({
   },
 
   pointValuesOf(patrolId) {
-    const map = new Map<string, Reading>()
+    const map = new Map<string, Reading[]>()
     get()
       .readings.filter((reading) => reading.patrolId === patrolId)
-      .forEach((reading) => map.set(reading.pointId, reading))
+      .forEach((reading) => {
+        const list = map.get(reading.pointId) ?? []
+        list.push(reading)
+        map.set(reading.pointId, list)
+      })
     return map
   }
 }))

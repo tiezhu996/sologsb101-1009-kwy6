@@ -12,7 +12,6 @@ import {
   deletePointCascade,
   deleteStationCascade,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
   type DeviceRow,
   type PointRow,
@@ -173,6 +172,7 @@ export const useStationStore = create<StationState>((set, get) => ({
       standardMax: Number(draft.standardMax) || 0,
       unit: draft.unit,
       isCritical: draft.isCritical,
+      standardRevision: 1,
       createdAt: now,
       updatedAt: now
     }
@@ -181,14 +181,18 @@ export const useStationStore = create<StationState>((set, get) => ({
   },
 
   async updatePoint(id, patch) {
+    const current = get().points.find((point) => point.id === id)
     const next: Partial<PointRow> = { ...patch, updatedAt: Date.now() }
     if (patch.name !== undefined) next.name = patch.name.trim()
     if (patch.deviceId !== undefined) {
       const device = await db.devices.get(patch.deviceId)
       if (device) next.stationId = device.stationId
     }
+    // 标准区间 / 关键点改动 → 新版本，只影响此后录入的新批次；历史读数判级冻结不翻案
+    if (current && standardTouched(current, patch)) {
+      next.standardRevision = current.standardRevision + 1
+    }
     await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
   },
 
   async removePoint(id) {
@@ -212,6 +216,7 @@ export const useStationStore = create<StationState>((set, get) => ({
         standardMax: template.standardMax,
         unit: template.unit,
         isCritical: template.isCritical,
+        standardRevision: 1,
         createdAt: now,
         updatedAt: now
       }))
@@ -235,41 +240,46 @@ export const useStationStore = create<StationState>((set, get) => ({
 
   async commitStandardDraft(pointId) {
     const draft = get().standardDraft[pointId]
-    if (!draft) return
+    const current = get().points.find((point) => point.id === pointId)
+    if (!draft || !current) return
     const min = Math.min(draft.standardMin, draft.standardMax)
     const max = Math.max(draft.standardMin, draft.standardMax)
+    const touched =
+      current.standardMin !== min || current.standardMax !== max || current.isCritical !== draft.isCritical
     await db.points.update(pointId, {
       standardMin: min,
       standardMax: max > min ? max : min + 0.001,
       isCritical: draft.isCritical,
+      // 标准改过后自增版本：历史读数按录入时标准判级不翻案，新版本只影响新批次
+      standardRevision: touched ? current.standardRevision + 1 : current.standardRevision,
       updatedAt: Date.now()
     })
     get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
   },
 
   async commitAllStandardDrafts() {
     const entries = Object.entries(get().standardDraft)
     if (entries.length === 0) return 0
+    const now = Date.now()
     const rows = get()
       .points.filter((point) => entries.some(([id]) => id === point.id))
       .map((point) => {
         const draft = get().standardDraft[point.id]
         const min = Math.min(draft.standardMin, draft.standardMax)
         const max = Math.max(draft.standardMin, draft.standardMax)
+        const touched =
+          point.standardMin !== min || point.standardMax !== max || point.isCritical !== draft.isCritical
         return {
           ...point,
           standardMin: min,
           standardMax: max > min ? max : min + 0.001,
           isCritical: draft.isCritical,
-          updatedAt: Date.now()
+          standardRevision: touched ? point.standardRevision + 1 : point.standardRevision,
+          updatedAt: now
         }
       })
     if (rows.length > 0) await db.points.bulkPut(rows)
     get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
-    }
     return rows.length
   },
 
@@ -321,5 +331,16 @@ liveQuery(async () =>
 ).subscribe({
   next: (rows) => useStationStore.setState({ points: rows })
 })
+
+/** 标准区间或关键点是否被改动（仅这些改动需要自增 standardRevision） */
+function standardTouched(
+  current: Point,
+  patch: Partial<PointDraft>
+): boolean {
+  if (patch.standardMin !== undefined && Number(patch.standardMin) !== current.standardMin) return true
+  if (patch.standardMax !== undefined && Number(patch.standardMax) !== current.standardMax) return true
+  if (patch.isCritical !== undefined && patch.isCritical !== current.isCritical) return true
+  return false
+}
 
 export type { DeviceState, DeviceType }

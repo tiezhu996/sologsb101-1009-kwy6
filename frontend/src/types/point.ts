@@ -11,6 +11,11 @@ export interface Point {
   unit: string
   /** 是否关键点：关键点偏差超过 5% 即判严重超标 */
   isCritical: boolean
+  /**
+   * 标准值版本号：每次修改上下限/关键点后自增。
+   * 读数在录入时冻结当前版本，之后改标准不回翻历史判级，只影响新批次。
+   */
+  standardRevision: number
   createdAt: number
   updatedAt: number
 }

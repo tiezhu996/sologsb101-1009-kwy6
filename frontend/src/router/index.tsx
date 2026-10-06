@@ -1,5 +1,5 @@
 /**
- * 路由表：/stations、/points、/patrols、/abnormal、/leaks、/plans
+ * 路由表：/stations、/points、/patrols、/abnormal、/leaks、/sync、/plans
  * 页面按路由懒加载，构建时自动分包。
  */
 import { Suspense, lazy, type ReactNode } from 'react'
@@ -12,6 +12,7 @@ const PointConfig = lazy(() => import('../pages/PointConfig'))
 const PatrolEntry = lazy(() => import('../pages/PatrolEntry'))
 const AbnormalBoard = lazy(() => import('../pages/AbnormalBoard'))
 const LeakBoard = lazy(() => import('../pages/LeakBoard'))
+const SyncCenter = lazy(() => import('../pages/SyncCenter'))
 const PlanList = lazy(() => import('../pages/PlanList'))
 
 export const ROUTES = {
@@ -20,6 +21,7 @@ export const ROUTES = {
   patrols: '/patrols',
   abnormal: '/abnormal',
   leaks: '/leaks',
+  sync: '/sync',
   plans: '/plans'
 } as const
 
@@ -42,6 +44,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'patrols', element: withSuspense(<PatrolEntry />) },
       { path: 'abnormal', element: withSuspense(<AbnormalBoard />) },
       { path: 'leaks', element: withSuspense(<LeakBoard />) },
+      { path: 'sync', element: withSuspense(<SyncCenter />) },
       { path: 'plans', element: withSuspense(<PlanList />) },
       { path: '*', element: <Navigate to={ROUTES.stations} replace /> }
     ]

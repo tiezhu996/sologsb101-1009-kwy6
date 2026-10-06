@@ -90,9 +90,6 @@ export default function PointConfig() {
     return point.name.toLowerCase().includes(text) || (device ? device.model.toLowerCase().includes(text) : false)
   })
 
-  const abnormalCountOf = (pointId: string): number =>
-    readingTable.rows.filter((row) => row.pointId === pointId && row.isAbnormal).length
-
   const deviceOptions = stationStore.devices
     .filter((device) => !filter.stationId || device.stationId === filter.stationId)
     .map((device) => {
@@ -133,7 +130,7 @@ export default function PointConfig() {
     }
     if (editingId) {
       await stationStore.updatePoint(editingId, payload)
-      Message.success('点位已更新，历史读数偏差率已重算')
+      Message.success('点位已更新；若标准区间改动将生成新版本，历史读数仍按录入时标准判级')
     } else {
       await stationStore.createPoint(payload)
       Message.success('点位已创建')
@@ -152,7 +149,7 @@ export default function PointConfig() {
       Message.warning('没有待提交的标准值草稿')
       return
     }
-    Message.success(`已提交 ${count} 个点位的标准值，历史读数已重算`)
+    Message.success(`已提交 ${count} 个点位的新标准版本；历史异常与已派处置单不翻案，仅影响新批次`)
   }
 
   const openTemplate = (): void => {
@@ -233,7 +230,7 @@ export default function PointConfig() {
               disabled={!draft}
               onClick={async () => {
                 await stationStore.commitStandardDraft(record.id)
-                Message.success(`${record.name} 标准值已保存，历史读数已重算`)
+                Message.success(`${record.name} 标准值已生成新版本；历史读数按录入时标准保留判级`)
               }}
             >
               保存
@@ -264,6 +261,11 @@ export default function PointConfig() {
       }
     },
     {
+      title: '标准版本',
+      width: 100,
+      render: (_value, record) => <Tag color="arcoblue">v{record.standardRevision}</Tag>
+    },
+    {
       title: '标准区间',
       width: 160,
       render: (_value, record) => rangeText(record.standardMin, record.standardMax, record.unit)
@@ -272,12 +274,14 @@ export default function PointConfig() {
       title: '异常读数',
       width: 170,
       render: (_value, record) => {
-        const count = abnormalCountOf(record.id)
-        if (count === 0) return <Tag color="green">无异常</Tag>
-        const worst = readingTable.rows
-          .filter((row) => row.pointId === record.id && row.isAbnormal)
-          .reduce((max, row) => Math.max(max, row.deviationPct), 0)
-        return <AbnormalTag level={abnormalLevelOf(worst, record.isCritical)} deviationPct={worst} size="small" />
+        const pointReadings = readingTable.rows.filter((row) => row.pointId === record.id)
+        const abnormal = pointReadings.filter((row) => row.isAbnormal)
+        if (abnormal.length === 0) return <Tag color="green">无异常</Tag>
+        const worst = abnormal.reduce(
+          (maxItem, row) => (row.deviationPct > maxItem.deviationPct ? row : maxItem),
+          abnormal[0]
+        )
+        return <AbnormalTag level={abnormalLevelOf(worst.deviationPct, worst.isCriticalAtEntry)} deviationPct={worst.deviationPct} size="small" />
       }
     },
     {
@@ -352,7 +356,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             点位清单（{rows.length} / {stats.total}）
           </h3>
-          <span className="muted">标准值改动先进入草稿，保存后自动重算历史读数偏差率</span>
+          <span className="muted">标准值改动先进草稿，保存后自增版本；历史读数按录入时版本判级不翻案，新版本只影响新批次</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel

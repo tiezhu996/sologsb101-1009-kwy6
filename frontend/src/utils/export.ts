@@ -8,6 +8,9 @@ import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
 import { abnormalLevelOf, deviationPctOf, formatLeakConcentration } from '@/utils/range'
+import { READING_SOURCE_LABEL, READING_SYNC_LABEL, SITE_VERIFY_LABEL } from '@/types/source'
+import type { Conflict } from '@/types/conflict'
+import { CONFLICT_TYPE_LABEL } from '@/types/conflict'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -50,17 +53,21 @@ export function exportReadingCsv(
     '调压站',
     '设备',
     '点位',
-    '标准下限',
-    '标准上限',
+    '标准下限(录入时)',
+    '标准上限(录入时)',
+    '标准版本',
     '单位',
-    '关键点',
+    '关键点(录入时)',
+    '录入班组',
+    '合并状态',
+    '现场值核查',
     '计划日期',
     '实际日期',
     '巡检人',
     '巡检状态',
     '读数',
     '偏差率(%)',
-    '判定',
+    '判定(录入时标准)',
     '备注'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -69,22 +76,27 @@ export function exportReadingCsv(
     const patrol = patrols.find((item) => item.id === reading.patrolId)
     const device = point ? devices.find((item) => item.id === point.deviceId) : undefined
     const station = patrol ? stations.find((item) => item.id === patrol.stationId) : undefined
+    const unit = point ? point.unit : ''
     lines.push(
       [
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
-        point ? point.standardMin : '—',
-        point ? point.standardMax : '—',
-        point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        reading.standardMinAtEntry ?? (point ? point.standardMin : '—'),
+        reading.standardMaxAtEntry ?? (point ? point.standardMax : '—'),
+        reading.standardRevision ?? 1,
+        unit || '—',
+        reading.isCriticalAtEntry ?? (point ? point.isCritical : false) ? '是' : '否',
+        READING_SOURCE_LABEL[reading.source ?? 'site'],
+        READING_SYNC_LABEL[reading.syncState ?? 'synced'],
+        SITE_VERIFY_LABEL[reading.verifyState ?? 'none'],
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        abnormalLevelOf(reading.deviationPct, reading.isCriticalAtEntry ?? (point ? point.isCritical : false)),
         reading.note || '—'
       ]
         .map(csvCell)
@@ -98,7 +110,7 @@ export function exportReadingCsv(
 
 /** 泄漏处置台账 CSV */
 export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Leak[]): string {
-  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人']
+  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人', '冲突拦截', '裁决采信读数']
   const lines: string[] = [header.map(csvCell).join(',')]
   leaks.forEach((leak) => {
     const device = devices.find((item) => item.id === leak.deviceId)
@@ -115,7 +127,9 @@ export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Lea
         leak.state,
         leak.retestValuePpm,
         leak.state === '已复检' ? (pass ? '合格' : '不合格') : '未复检',
-        leak.handler || '—'
+        leak.handler || '—',
+        leak.blockedByConflict ? `未决冲突 ${leak.blockedByConflict}` : '—',
+        leak.factReadingId || '—'
       ]
         .map(csvCell)
         .join(',')
@@ -164,6 +178,48 @@ export function exportStructureVersion(summary: {
 }): string {
   const filename = `gbgaspress-structure-${stampSuffix()}.json`
   download(filename, JSON.stringify(summary, null, 2), 'application/json;charset=utf-8')
+  return filename
+}
+
+/** 冲突台账 CSV：冲突来源、差异两版、受影响记录与裁决结论 */
+export function exportConflictCsv(
+  stations: Station[],
+  devices: Device[],
+  points: import('@/types/point').Point[],
+  conflicts: Conflict[]
+): string {
+  const header = ['冲突类型', '状态', '调压站', '设备', '点位', '现场值', '外检值', '处置单记载(ppm)', '冲突来源', '受影响读数', '受影响处置单', '采信来源', '裁决负责人', '裁决说明']
+  const lines: string[] = [header.map(csvCell).join(',')]
+  conflicts.forEach((conflict) => {
+    const point = points.find((item) => item.id === conflict.pointId)
+    const device = devices.find((item) => item.id === conflict.deviceId)
+    const station = stations.find((item) => item.id === conflict.stationId)
+    const site = conflict.sides.find((side) => side.source === 'site')
+    const external = conflict.sides.find((side) => side.source === 'external')
+    const unit = point?.unit ?? ''
+    lines.push(
+      [
+        CONFLICT_TYPE_LABEL[conflict.type],
+        conflict.status === 'open' ? '未决' : '已裁决',
+        station ? station.name : '—',
+        device ? `${device.type} ${device.model}` : '—',
+        point ? point.name : '—',
+        site ? `${site.value} ${unit}` : '—',
+        external ? `${external.value} ${unit}` : '—',
+        conflict.leakConcentrationPpm || '—',
+        conflict.originText,
+        conflict.affectedReadingIds.join(' / ') || '—',
+        conflict.affectedLeakIds.join(' / ') || '—',
+        conflict.chosenSource === 'site' ? '巡检班现场值' : conflict.chosenSource === 'external' ? '外检班原值' : conflict.chosenSource === 'leak' ? '处置单记载' : '未决',
+        conflict.decidedBy || '—',
+        conflict.decisionNote || '—'
+      ]
+        .map(csvCell)
+        .join(',')
+    )
+  })
+  const filename = `双班合并冲突台账-${stampSuffix()}.csv`
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

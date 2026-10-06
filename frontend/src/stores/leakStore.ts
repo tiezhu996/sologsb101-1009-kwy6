@@ -7,11 +7,19 @@ import { liveQuery } from 'dexie'
 import { createId, db, type LeakRow } from '@/utils/db'
 import {
   LEAK_RETEST_PASS_PPM,
+  isLeakBlocked,
   retestPassed,
   type Leak,
   type LeakDraft,
   type LeakState
 } from '@/types/leak'
+
+export interface LeakAdvanceBlocked {
+  blocked: true
+  conflictId: string
+}
+
+export type LeakAdvanceResult = LeakState | null | LeakAdvanceBlocked
 
 interface LeakState_ {
   leaks: Leak[]
@@ -24,8 +32,9 @@ interface LeakState_ {
   createLeak: (draft: LeakDraft) => Promise<Leak>
   updateLeak: (id: string, patch: Partial<LeakDraft>) => Promise<void>
   removeLeak: (id: string) => Promise<void>
-  advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakState | null>
-  submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean>
+  advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakAdvanceResult>
+  submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean | LeakAdvanceBlocked>
+  isBlocked: (id: string) => boolean
   hasLeakOfDevice: (deviceId: string) => boolean
   createFromAbnormal: (payload: {
     deviceId: string
@@ -72,6 +81,8 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       state: draft.state,
       retestValuePpm: Number(draft.retestValuePpm) || 0,
       handler: draft.handler.trim(),
+      blockedByConflict: '',
+      factReadingId: '',
       createdAt: now,
       updatedAt: now
     }
@@ -93,6 +104,8 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   async advance(id, params) {
     const leak = get().leaks.find((item) => item.id === id)
     if (!leak) return null
+    // 外检值与处置单冲突未裁决前，不能继续处置 / 完成闭环
+    if (isLeakBlocked(leak)) return { blocked: true, conflictId: leak.blockedByConflict }
     const next: LeakState | null = leak.state === '待处置' ? '已处置' : leak.state === '已处置' ? '已复检' : null
     if (!next) return null
     const patch: Partial<LeakRow> = { state: next, updatedAt: Date.now() }
@@ -103,6 +116,10 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   },
 
   async submitRetest(id, retestValuePpm, handler) {
+    const leak = get().leaks.find((item) => item.id === id)
+    if (leak && isLeakBlocked(leak)) {
+      return { blocked: true, conflictId: leak.blockedByConflict }
+    }
     const value = Number(retestValuePpm) || 0
     await db.leaks.update(id, {
       state: '已复检',
@@ -111,6 +128,11 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       updatedAt: Date.now()
     })
     return retestPassed(value)
+  },
+
+  isBlocked(id) {
+    const leak = get().leaks.find((item) => item.id === id)
+    return leak ? isLeakBlocked(leak) : false
   },
 
   hasLeakOfDevice(deviceId) {
