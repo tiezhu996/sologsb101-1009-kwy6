@@ -6,6 +6,7 @@ import type { Device } from '@/types/device'
 import type { Point } from '@/types/point'
 import type { Patrol } from '@/types/patrol'
 import type { Reading } from '@/types/reading'
+import { snapshotOfReading } from '@/types/reading'
 import type { Leak } from '@/types/leak'
 import { abnormalLevelOf, deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
@@ -50,10 +51,12 @@ export function exportReadingCsv(
     '调压站',
     '设备',
     '点位',
-    '标准下限',
-    '标准上限',
+    '判级标准下限(录入时)',
+    '判级标准上限(录入时)',
+    '标准版本',
     '单位',
-    '关键点',
+    '来源',
+    '核查状态',
     '计划日期',
     '实际日期',
     '巡检人',
@@ -69,22 +72,28 @@ export function exportReadingCsv(
     const patrol = patrols.find((item) => item.id === reading.patrolId)
     const device = point ? devices.find((item) => item.id === point.deviceId) : undefined
     const station = patrol ? stations.find((item) => item.id === patrol.stationId) : undefined
+    const snapshot = snapshotOfReading(
+      reading,
+      point ? { standardMin: point.standardMin, standardMax: point.standardMax, isCritical: point.isCritical } : null
+    )
     lines.push(
       [
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
-        point ? point.standardMin : '—',
-        point ? point.standardMax : '—',
+        snapshot.standardMin,
+        snapshot.standardMax,
+        reading.standardRevision,
         point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        reading.source,
+        reading.verifyStatus,
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        abnormalLevelOf(reading.deviationPct, snapshot.isCritical),
         reading.note || '—'
       ]
         .map(csvCell)

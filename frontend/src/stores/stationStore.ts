@@ -12,13 +12,13 @@ import {
   deletePointCascade,
   deleteStationCascade,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
   type DeviceRow,
   type PointRow,
   type StationRow
 } from '@/utils/db'
 import type { Device, DeviceDraft, DeviceState, DeviceType } from '@/types/device'
+import { INITIAL_STANDARD_REVISION } from '@/types/point'
 import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft } from '@/types/point'
 import { createEmptyPointFilter } from '@/types/point'
 import type { Station, StationDraft, StationGrade } from '@/types/station'
@@ -31,6 +31,17 @@ export interface StationFilterState {
 
 export function createEmptyStationFilter(): StationFilterState {
   return { keyword: '', grades: [], deviceTypes: [] }
+}
+
+/** 点位标准是否真正变更（上下限或关键点标记），决定标准版本是否 +1 */
+function thisStandardChanged(
+  current: Point,
+  patch: Partial<PointDraft>
+): boolean {
+  if (patch.standardMin !== undefined && Number(patch.standardMin) !== current.standardMin) return true
+  if (patch.standardMax !== undefined && Number(patch.standardMax) !== current.standardMax) return true
+  if (patch.isCritical !== undefined && patch.isCritical !== current.isCritical) return true
+  return false
 }
 
 interface StationState {
@@ -173,6 +184,7 @@ export const useStationStore = create<StationState>((set, get) => ({
       standardMax: Number(draft.standardMax) || 0,
       unit: draft.unit,
       isCritical: draft.isCritical,
+      standardRevision: INITIAL_STANDARD_REVISION,
       createdAt: now,
       updatedAt: now
     }
@@ -181,14 +193,18 @@ export const useStationStore = create<StationState>((set, get) => ({
   },
 
   async updatePoint(id, patch) {
+    const current = await db.points.get(id)
     const next: Partial<PointRow> = { ...patch, updatedAt: Date.now() }
     if (patch.name !== undefined) next.name = patch.name.trim()
     if (patch.deviceId !== undefined) {
       const device = await db.devices.get(patch.deviceId)
       if (device) next.stationId = device.stationId
     }
+    // 标准上下限或关键点标记变更 → 标准版本 +1，仅影响新批次；历史读数保留录入时快照判级
+    if (current && thisStandardChanged(current, patch)) {
+      next.standardRevision = (current.standardRevision || INITIAL_STANDARD_REVISION) + 1
+    }
     await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
   },
 
   async removePoint(id) {
@@ -212,6 +228,7 @@ export const useStationStore = create<StationState>((set, get) => ({
         standardMax: template.standardMax,
         unit: template.unit,
         isCritical: template.isCritical,
+        standardRevision: INITIAL_STANDARD_REVISION,
         createdAt: now,
         updatedAt: now
       }))
@@ -236,40 +253,51 @@ export const useStationStore = create<StationState>((set, get) => ({
   async commitStandardDraft(pointId) {
     const draft = get().standardDraft[pointId]
     if (!draft) return
+    const current = get().points.find((point) => point.id === pointId)
     const min = Math.min(draft.standardMin, draft.standardMax)
     const max = Math.max(draft.standardMin, draft.standardMax)
+    const changed =
+      !current ||
+      current.standardMin !== min ||
+      current.standardMax !== max ||
+      current.isCritical !== draft.isCritical
     await db.points.update(pointId, {
       standardMin: min,
       standardMax: max > min ? max : min + 0.001,
       isCritical: draft.isCritical,
+      standardRevision: changed
+        ? (current?.standardRevision || INITIAL_STANDARD_REVISION) + 1
+        : current?.standardRevision || INITIAL_STANDARD_REVISION,
       updatedAt: Date.now()
     })
     get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
   },
 
   async commitAllStandardDrafts() {
     const entries = Object.entries(get().standardDraft)
     if (entries.length === 0) return 0
+    const now = Date.now()
     const rows = get()
       .points.filter((point) => entries.some(([id]) => id === point.id))
       .map((point) => {
         const draft = get().standardDraft[point.id]
         const min = Math.min(draft.standardMin, draft.standardMax)
         const max = Math.max(draft.standardMin, draft.standardMax)
+        const changed =
+          point.standardMin !== min || point.standardMax !== max || point.isCritical !== draft.isCritical
         return {
           ...point,
           standardMin: min,
           standardMax: max > min ? max : min + 0.001,
           isCritical: draft.isCritical,
-          updatedAt: Date.now()
+          standardRevision: changed
+            ? (point.standardRevision || INITIAL_STANDARD_REVISION) + 1
+            : point.standardRevision || INITIAL_STANDARD_REVISION,
+          updatedAt: now
         }
       })
     if (rows.length > 0) await db.points.bulkPut(rows)
     get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
-    }
     return rows.length
   },
 

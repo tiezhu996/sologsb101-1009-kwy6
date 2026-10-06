@@ -15,6 +15,10 @@ export interface Leak {
   /** 复检浓度（ppm） */
   retestValuePpm: number
   handler: string
+  /** 派单所依据的异常读数 id（可空） */
+  sourceReadingId: string | null
+  /** 未决的外检值冲突 id：存在时处置单不能复检闭环 */
+  conflictId: string | null
   createdAt: number
   updatedAt: number
 }
@@ -39,6 +43,8 @@ export interface LeakDraft {
   state: LeakState
   retestValuePpm: number
   handler: string
+  sourceReadingId?: string | null
+  conflictId?: string | null
 }
 
 export const EMPTY_LEAK_DRAFT: LeakDraft = {
@@ -48,7 +54,9 @@ export const EMPTY_LEAK_DRAFT: LeakDraft = {
   measure: '',
   state: '待处置',
   retestValuePpm: 0,
-  handler: ''
+  handler: '',
+  sourceReadingId: null,
+  conflictId: null
 }
 
 export function createEmptyLeakDraft(): LeakDraft {

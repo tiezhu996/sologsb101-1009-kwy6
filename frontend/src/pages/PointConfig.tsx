@@ -90,9 +90,6 @@ export default function PointConfig() {
     return point.name.toLowerCase().includes(text) || (device ? device.model.toLowerCase().includes(text) : false)
   })
 
-  const abnormalCountOf = (pointId: string): number =>
-    readingTable.rows.filter((row) => row.pointId === pointId && row.isAbnormal).length
-
   const deviceOptions = stationStore.devices
     .filter((device) => !filter.stationId || device.stationId === filter.stationId)
     .map((device) => {
@@ -133,7 +130,7 @@ export default function PointConfig() {
     }
     if (editingId) {
       await stationStore.updatePoint(editingId, payload)
-      Message.success('点位已更新，历史读数偏差率已重算')
+      Message.success('点位已更新；标准改版只影响新批次，历史读数仍按录入时标准判级')
     } else {
       await stationStore.createPoint(payload)
       Message.success('点位已创建')
@@ -152,7 +149,7 @@ export default function PointConfig() {
       Message.warning('没有待提交的标准值草稿')
       return
     }
-    Message.success(`已提交 ${count} 个点位的标准值，历史读数已重算`)
+    Message.success(`已提交 ${count} 个点位的新标准版本，历史读数判级保持不变`)
   }
 
   const openTemplate = (): void => {
@@ -233,7 +230,7 @@ export default function PointConfig() {
               disabled={!draft}
               onClick={async () => {
                 await stationStore.commitStandardDraft(record.id)
-                Message.success(`${record.name} 标准值已保存，历史读数已重算`)
+                Message.success(`${record.name} 标准值已保存为新版本，历史读数判级不变`)
               }}
             >
               保存
@@ -269,15 +266,23 @@ export default function PointConfig() {
       render: (_value, record) => rangeText(record.standardMin, record.standardMax, record.unit)
     },
     {
+      title: '标准版本',
+      width: 100,
+      render: (_value, record) => <Tag color="arcoblue">v{record.standardRevision}</Tag>
+    },
+    {
       title: '异常读数',
       width: 170,
       render: (_value, record) => {
-        const count = abnormalCountOf(record.id)
+        const pointReadings = readingTable.rows.filter((row) => row.pointId === record.id)
+        const count = pointReadings.filter((row) => row.isAbnormal && row.verifyStatus !== '未采纳').length
         if (count === 0) return <Tag color="green">无异常</Tag>
-        const worst = readingTable.rows
-          .filter((row) => row.pointId === record.id && row.isAbnormal)
+        const worst = pointReadings
+          .filter((row) => row.isAbnormal && row.verifyStatus !== '未采纳')
           .reduce((max, row) => Math.max(max, row.deviationPct), 0)
-        return <AbnormalTag level={abnormalLevelOf(worst, record.isCritical)} deviationPct={worst} size="small" />
+        // 异常级别按读数录入时的关键点快照，标准改版不影响历史分级
+        const anyCriticalAtEntry = pointReadings.some((row) => row.isCriticalAtEntry)
+        return <AbnormalTag level={abnormalLevelOf(worst, anyCriticalAtEntry)} deviationPct={worst} size="small" />
       }
     },
     {
@@ -326,11 +331,15 @@ export default function PointConfig() {
         <StatBadge label="设备数" value={stationStore.devices.length} suffix="台" tone="info" />
         <StatBadge
           label="异常读数占比"
-          value={readingTable.rows.filter((row) => row.isAbnormal).length}
+          value={readingTable.rows.filter((row) => row.isAbnormal && row.verifyStatus !== '未采纳').length}
           percent={
             readingTable.rows.length === 0
               ? 0
-              : Math.round((readingTable.rows.filter((row) => row.isAbnormal).length / readingTable.rows.length) * 100)
+              : Math.round(
+                  (readingTable.rows.filter((row) => row.isAbnormal && row.verifyStatus !== '未采纳').length /
+                    readingTable.rows.length) *
+                    100
+                )
           }
           tone="danger"
         />
@@ -352,7 +361,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             点位清单（{rows.length} / {stats.total}）
           </h3>
-          <span className="muted">标准值改动先进入草稿，保存后自动重算历史读数偏差率</span>
+          <span className="muted">标准值改版先进草稿，提交后版本号 +1，仅对之后录入的新批次生效，历史异常与已派处置单不翻级</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel

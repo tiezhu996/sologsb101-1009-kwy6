@@ -1,10 +1,12 @@
 /**
  * /patrols 巡检录入
- * 按计划日期逐点录入压力/温度/泄漏浓度，录入即与标准区间比对并给出异常级别。
- * 消费 Patrol、Reading、Point；复用 <AbnormalTag>、<FilterBar>、<EmptyPanel>、<StatBadge>。
+ * 巡检班与外检班各记一份：巡检班现场值断网可离线暂存（恢复后按设备/点位合并），
+ * 外检班原值仅在线直写且冻结；录入即按「录入时标准」比对并给出异常级别。
+ * 消费 Patrol、Reading、Point；复用 <AbnormalTag>、<FilterBar>、<EmptyPanel>、<StatBadge>、<SourceTag>、<OnlineBadge>。
  */
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Alert,
   Button,
   Form,
   Input,
@@ -12,6 +14,7 @@ import {
   Message,
   Modal,
   Popconfirm,
+  Radio,
   Space,
   Table,
   Tag
@@ -20,17 +23,23 @@ import type { TableColumnProps } from '@arco-design/web-react'
 import AbnormalTag from '@/components/common/AbnormalTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
+import SourceTag from '@/components/common/SourceTag'
 import StatBadge from '@/components/common/StatBadge'
+import OnlineBadge from '@/components/common/OnlineBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { usePatrolStore } from '@/stores/patrolStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { usePatrolGap } from '@/hooks/usePatrolGap'
+import { snapshotOfReading } from '@/types/reading'
 import { PATROL_STATES, type Patrol, type PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
-import type { Reading } from '@/types/reading'
+import type { Reading, ReadingSource } from '@/types/reading'
+import { formatValue, rangeText } from '@/utils/range'
 
 export default function PatrolEntry() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
+  const syncStore = useSyncStore()
 
   const [completeForm] = Form.useForm<{ patrolDate: string; patrolman: string; envNote: string }>()
   const [noteForm] = Form.useForm<{ note: string }>()
@@ -40,6 +49,8 @@ export default function PatrolEntry() {
 
   const gap = usePatrolGap(patrolStore.patrols)
   const filter = patrolStore.filter
+  const source = patrolStore.entrySource
+  const online = syncStore.online
 
   const filterSelects = useMemo(
     () => [
@@ -78,26 +89,56 @@ export default function PatrolEntry() {
   }, [activePatrol, stationStore.devices, stationStore.points])
 
   const activeReadings = activePatrol ? patrolStore.readingsOfPatrol(activePatrol.id) : []
+  const pendingJobs = activePatrol ? syncStore.syncJobs.filter((job) => job.payload.patrolId === activePatrol.id && job.state !== '已合并') : []
 
   useEffect(() => {
-    if (activePatrol) patrolStore.seedDraftFromReadings(activePatrol.id, activePoints)
-    // 仅在切换巡检任务或点位集合变化时回填草稿
-  }, [activePatrol?.id, activePoints.length])
+    if (activePatrol) patrolStore.seedDraftFromReadings(activePatrol.id, activePoints, patrolStore.entrySource)
+    // 仅在切换巡检任务、点位集合或录入班组时回填草稿
+  }, [activePatrol?.id, activePoints.length, patrolStore.entrySource])
+
+  const draftJudgementOf = (point: Point, value: number | undefined) =>
+    value === undefined ? null : patrolStore.judge(point, value)
 
   const abnormalInDraft = activePoints.filter((point) => {
-    const value = activePatrol ? patrolStore.readingDraft[`${activePatrol.id}:${point.id}`] : undefined
+    const value = patrolStore.readingDraft[`${source}:${activePatrol?.id ?? ''}:${point.id}`]
     if (value === undefined) return false
     return patrolStore.judge(point, value).isAbnormal
   }).length
 
   const saveAll = async (): Promise<void> => {
     if (!activePatrol) return
-    const count = await patrolStore.saveReadingDrafts(activePatrol.id, activePoints)
+    if (source === '外检班' && !online) {
+      Message.error('现场断网，外检班原值不能录入；请先恢复联网，或切换到巡检班离线暂存')
+      return
+    }
+    const count = await patrolStore.saveReadingDrafts(activePatrol.id, activePoints, source)
     if (count === 0) {
       Message.warning('没有可保存的读数，请先录入')
       return
     }
-    Message.success(`已保存 ${count} 条读数，异常判定已同步更新`)
+    if (source === '巡检班' && !online) {
+      Message.success(`已离线暂存 ${count} 条现场值，恢复联网后自动按设备/点位合并`)
+    } else {
+      Message.success(`已保存 ${count} 条${source === '外检班' ? '外检原值（只读冻结）' : '现场值'}`)
+    }
+  }
+
+  const saveOne = async (point: Point, value: number): Promise<void> => {
+    if (!activePatrol) return
+    const saved = patrolStore
+      .readingsOfPatrol(activePatrol.id)
+      .filter((reading) => reading.pointId === point.id && reading.source === source)
+      .sort((a, b) => b.createdAt - a.createdAt)[0]
+    const result = await patrolStore.saveSingleReading(activePatrol.id, point, value, saved?.note ?? '', source)
+    if (!result.ok) {
+      Message.error(result.blocked ?? '保存失败')
+      return
+    }
+    if (result.offlineQueued) {
+      Message.success(`${point.name} 现场值已离线暂存，恢复联网后合并`)
+    } else {
+      Message.success(`${point.name} 读数已保存${source === '外检班' ? '（外检原值冻结）' : ''}`)
+    }
   }
 
   const openComplete = (): void => {
@@ -112,9 +153,12 @@ export default function PatrolEntry() {
 
   const submitComplete = async (): Promise<void> => {
     if (!activePatrol) return
+    if (source === '巡检班' && pendingJobs.some((job) => job.state !== '已合并')) {
+      // 允许完成但提示有未合并现场值
+      Message.warning('仍有现场值未完成合并，完成后可到「合并与冲突」中心重试')
+    }
     const values = await completeForm.validate().catch(() => null)
     if (!values) return
-    await patrolStore.saveReadingDrafts(activePatrol.id, activePoints)
     await patrolStore.completePatrol(activePatrol.id, values.patrolDate, values.patrolman, values.envNote)
     Message.success('巡检已完成，异常读数可在异常分级页派发处置单')
     setCompleteOpen(false)
@@ -126,6 +170,10 @@ export default function PatrolEntry() {
   }
 
   const openNote = (reading: Reading): void => {
+    if (reading.frozen) {
+      Message.info('外检原值只读，不能修改备注')
+      return
+    }
     setNoteTarget(reading)
     noteForm.setFieldsValue({ note: reading.note })
     setNoteOpen(true)
@@ -134,12 +182,7 @@ export default function PatrolEntry() {
   const submitNote = async (): Promise<void> => {
     const values = await noteForm.validate().catch(() => null)
     if (!values || !noteTarget) return
-    await patrolStore.saveSingleReading(
-      noteTarget.patrolId,
-      stationStore.points.find((point) => point.id === noteTarget.pointId) as Point,
-      noteTarget.value,
-      values.note
-    )
+    await patrolStore.updateReadingNote(noteTarget, values.note)
     Message.success('现场备注已保存')
     setNoteOpen(false)
   }
@@ -147,44 +190,68 @@ export default function PatrolEntry() {
   const readingColumns: TableColumnProps<Reading>[] = [
     {
       title: '点位',
-      width: 140,
+      width: 130,
       render: (_value, record) => stationStore.points.find((point) => point.id === record.pointId)?.name ?? '点位已删除'
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '来源 / 核查',
+      width: 150,
+      render: (_value, record) => <SourceTag source={record.source} verifyStatus={record.verifyStatus} frozen={record.frozen} size="small" />
+    },
+    {
+      title: '判级标准（录入时）',
+      width: 200,
       render: (_value, record) => {
         const point = stationStore.points.find((item) => item.id === record.pointId)
-        return point ? `${point.standardMin} ~ ${point.standardMax} ${point.unit}` : '—'
+        const snapshot = snapshotOfReading(record, point ? { standardMin: point.standardMin, standardMax: point.standardMax, isCritical: point.isCritical } : null)
+        return (
+          <span>
+            {rangeText(snapshot.standardMin, snapshot.standardMax, point?.unit ?? '')}
+            <Tag size="small" style={{ marginLeft: 4 }}>v{record.standardRevision}</Tag>
+          </span>
+        )
       }
     },
-    { title: '读数', dataIndex: 'value', width: 120, render: (value: number) => value },
-    { title: '偏差率', dataIndex: 'deviationPct', width: 110, render: (value: number) => `${value.toFixed(2)}%` },
+    { title: '读数', dataIndex: 'value', width: 110, render: (value: number, record) => formatValue(value, stationStore.points.find((p) => p.id === record.pointId)?.unit ?? '') },
+    { title: '偏差率', dataIndex: 'deviationPct', width: 100, render: (value: number) => `${value.toFixed(2)}%` },
     {
       title: '判定',
-      width: 160,
-      render: (_value, record) => {
-        const point = stationStore.points.find((item) => item.id === record.pointId)
-        if (!point) return <Tag>—</Tag>
-        return <AbnormalTag level={patrolStore.judge(point, record.value).level} size="small" />
-      }
+      width: 150,
+      render: (_value, record) => <AbnormalTag level={patrolStore.judgeReadingRow(record).level} size="small" />
     },
-    { title: '备注', dataIndex: 'note', width: 200, render: (value: string) => value || '—' },
+    {
+      title: '冲突',
+      width: 110,
+      render: (_value, record) =>
+        record.conflictId ? (
+          <Tag color="red" size="small">
+            待核查冲突
+          </Tag>
+        ) : (
+          <span className="muted">—</span>
+        )
+    },
+    { title: '备注', dataIndex: 'note', width: 180, render: (value: string) => value || '—' },
     {
       title: '操作',
-      width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="text" size="small" onClick={() => openNote(record)}>
-            备注
-          </Button>
-          <Popconfirm title="确认删除该读数？" onOk={() => patrolStore.removeReading(record.id)}>
-            <Button type="text" size="small" status="danger">
-              删除
+      width: 130,
+      render: (_value, record) =>
+        record.frozen ? (
+          <Tag color="purple" size="small">
+            原值锁定
+          </Tag>
+        ) : (
+          <Space size={4}>
+            <Button type="text" size="small" onClick={() => openNote(record)}>
+              备注
             </Button>
-          </Popconfirm>
-        </Space>
-      )
+            <Popconfirm title="确认删除该现场读数？" onOk={() => patrolStore.removeReading(record.id)}>
+              <Button type="text" size="small" status="danger">
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        )
     }
   ]
 
@@ -194,16 +261,19 @@ export default function PatrolEntry() {
         <div>
           <h2 className="page-head__title">巡检录入</h2>
           <p className="page-head__desc">
-            选定巡检任务后逐点录入读数，系统即时给出偏差率与异常级别；完成后可标记漏检或删除任务。
+            巡检班与外检班各记一份；巡检班现场值断网可继续录入并暂存，恢复联网后按设备/点位合并，同一点位两版都有值时保留两版。
           </p>
         </div>
         <div className="page-head__actions">
-          <Button disabled={!activePatrol} onClick={saveAll}>
-            保存全部读数
-          </Button>
-          <Button type="primary" disabled={!activePatrol} onClick={openComplete}>
-            完成巡检
-          </Button>
+          <Space>
+            <Button disabled={!activePatrol || (source === '外检班' && !online)} onClick={saveAll}>
+              {source === '巡检班' && !online ? '离线暂存全部' : '保存全部读数'}
+            </Button>
+            <Button type="primary" disabled={!activePatrol} onClick={openComplete}>
+              完成巡检
+            </Button>
+            <OnlineBadge />
+          </Space>
         </div>
       </div>
 
@@ -230,6 +300,7 @@ export default function PatrolEntry() {
             patrols.map((patrol) => {
               const item = gap.gapOf(patrol)
               const station = stationStore.stations.find((entry) => entry.id === patrol.stationId)
+              const jobCount = patrolStore.pendingJobCountOf(patrol.id)
               return (
                 <div
                   key={patrol.id}
@@ -251,6 +322,11 @@ export default function PatrolEntry() {
                   </div>
                   <div className="card-list-item__meta">
                     <span style={{ color: item.overdue ? '#f53f3f' : undefined }}>{item.text}</span>
+                    {jobCount > 0 ? (
+                      <Tag color="orange" size="small" style={{ marginLeft: 6 }}>
+                        {jobCount} 条现场值待合并
+                      </Tag>
+                    ) : null}
                   </div>
                   <div className="card-list-item__meta" style={{ gap: 8 }}>
                     <Button
@@ -299,8 +375,38 @@ export default function PatrolEntry() {
                   逐点录入 · {stationStore.stations.find((item) => item.id === activePatrol.stationId)?.name ?? ''}
                   <span className="muted"> （{activePatrol.planDate}，{activePoints.length} 个点位）</span>
                 </h3>
+                <Space>
+                  <Radio.Group
+                    type="button"
+                    size="small"
+                    value={source}
+                    onChange={(value) => patrolStore.setEntrySource(value as ReadingSource)}
+                  >
+                    <Radio value="巡检班">巡检班现场值</Radio>
+                    <Radio value="外检班">外检班原值</Radio>
+                  </Radio.Group>
+                </Space>
+              </div>
+
+              {source === '外检班' && !online ? (
+                <Alert
+                  type="error"
+                  style={{ margin: '8px 0' }}
+                  content="现场断网期间外检班原值不可录入（外检原值必须在线直写并冻结）。请恢复联网，或切换到巡检班现场值离线暂存。"
+                />
+              ) : null}
+              {source === '巡检班' && !online ? (
+                <Alert
+                  type="warning"
+                  style={{ margin: '8px 0' }}
+                  content="现场断网：巡检班读数将先离线暂存，恢复联网后自动按设备/点位合并，合并失败可在「合并与冲突」中心重试。"
+                />
+              ) : null}
+
+              <div className="card-list-item__meta" style={{ marginBottom: 8 }}>
                 <span className="muted">
-                  草稿中异常 {abnormalInDraft} 项 / 已保存异常 {activeReadings.filter((item) => item.isAbnormal).length} 项
+                  草稿中异常 {abnormalInDraft} 项 / 已存档异常 {activeReadings.filter((item) => item.isAbnormal).length} 项
+                  {pendingJobs.length > 0 ? ` / 待合并 ${pendingJobs.length} 项` : ''}
                 </span>
               </div>
 
@@ -320,10 +426,13 @@ export default function PatrolEntry() {
                   }}
                 >
                   {activePoints.map((point) => {
-                    const key = `${activePatrol.id}:${point.id}`
+                    const key = `${source}:${activePatrol.id}:${point.id}`
                     const value = patrolStore.readingDraft[key]
-                    const judgement = value === undefined ? null : patrolStore.judge(point, value)
-                    const saved = activeReadings.find((item) => item.pointId === point.id)
+                    const judgement = draftJudgementOf(point, value)
+                    const versions = activeReadings.filter((item) => item.pointId === point.id)
+                    const sameSource = versions.filter((item) => item.source === source)
+                    const otherSource = source === '外检班' ? '巡检班' : '外检班'
+                    const hasOther = versions.some((item) => item.source === otherSource)
                     return (
                       <div key={point.id} className="panel" style={{ padding: 12 }}>
                         <div className="card-list-item__head">
@@ -335,10 +444,34 @@ export default function PatrolEntry() {
                         </div>
                         <div className="card-list-item__meta">
                           <span>
-                            标准 {point.standardMin} ~ {point.standardMax} {point.unit}
+                            当前标准 {point.standardMin} ~ {point.standardMax} {point.unit}（v{point.standardRevision}）
                           </span>
-                          {saved ? <span>· 已存档 {saved.value}</span> : null}
                         </div>
+                        <div className="card-list-item__meta">
+                          {sameSource.length > 0 ? (
+                            <span>
+                              已存档（{source}）：
+                              {sameSource
+                                .slice()
+                                .sort((a, b) => b.createdAt - a.createdAt)
+                                .map((item) => (
+                                  <Tag key={item.id} size="small" color={item.verifyStatus === '待核查' ? 'orange' : item.verifyStatus === '未采纳' ? 'gray' : 'green'}>
+                                    {item.value}
+                                    {item.verifyStatus === '待核查' ? ' 待核查' : ''}
+                                  </Tag>
+                                ))}
+                            </span>
+                          ) : (
+                            <span className="muted">{source}尚未录入</span>
+                          )}
+                        </div>
+                        {hasOther ? (
+                          <div className="card-list-item__meta">
+                            <Tag color="red" size="small">
+                              同一点位已有{otherSource}值，保存后保留两版
+                            </Tag>
+                          </div>
+                        ) : null}
                         <Space style={{ marginTop: 8 }}>
                           <InputNumber
                             size="small"
@@ -348,19 +481,16 @@ export default function PatrolEntry() {
                             placeholder="输入读数"
                             onChange={(next: number | undefined) => {
                               if (next === undefined) return
-                              patrolStore.setReadingDraft(activePatrol.id, point.id, Number(next))
+                              patrolStore.setReadingDraft(source, activePatrol.id, point.id, Number(next))
                             }}
                           />
                           <Button
                             size="small"
-                            disabled={value === undefined}
-                            onClick={async () => {
-                              if (value === undefined) return
-                              await patrolStore.saveSingleReading(activePatrol.id, point, value, saved ? saved.note : '')
-                              Message.success(`${point.name} 读数已保存`)
-                            }}
+                            type="primary"
+                            disabled={value === undefined || (source === '外检班' && !online)}
+                            onClick={() => value !== undefined && saveOne(point, value)}
                           >
-                            保存
+                            {source === '巡检班' && !online ? '暂存' : '保存'}
                           </Button>
                         </Space>
                       </div>
@@ -369,7 +499,7 @@ export default function PatrolEntry() {
                 </div>
               )}
 
-              <h4 className="panel-title">已保存读数</h4>
+              <h4 className="panel-title">已保存读数（两班各版均保留）</h4>
               {activeReadings.length === 0 ? (
                 <EmptyPanel title="暂无已保存读数" description="录入后点击「保存全部读数」或逐点保存。" compact />
               ) : (
@@ -380,7 +510,7 @@ export default function PatrolEntry() {
                   data={activeReadings}
                   columns={readingColumns}
                   pagination={false}
-                  scroll={{ x: 1100 }}
+                  scroll={{ x: 1300 }}
                 />
               )}
             </>

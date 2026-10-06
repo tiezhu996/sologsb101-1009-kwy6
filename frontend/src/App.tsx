@@ -7,7 +7,9 @@ import { ROUTES } from './router'
 import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
+import { useSyncStore } from './stores/syncStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
+import OnlineBadge from './components/common/OnlineBadge'
 
 export default function App() {
   const location = useLocation()
@@ -15,6 +17,7 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
@@ -25,7 +28,8 @@ export default function App() {
     { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
     { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
-    { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
+    { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount },
+    { path: ROUTES.sync, label: '合并与冲突', count: syncStore.openConflictCount() + syncStore.failedCount() }
   ]
 
   const activePath = navItems.find((item) => location.pathname.startsWith(item.path))?.path ?? ROUTES.stations
@@ -79,6 +83,7 @@ export default function App() {
             )}
           </Space>
           <Space size={8} wrap>
+            <OnlineBadge compact />
             <Badge count={leakStore.counts()['待处置']} dotStyle={{ background: '#f53f3f' }} />
             <Button size="small" onClick={() => navigate(ROUTES.stations)}>
               调压站台账
@@ -95,7 +100,7 @@ export default function App() {
         <span>数据仅保存于本机浏览器（IndexedDB / localStorage），不上传任何服务器。</span>
         <span>
           调压站 {stationStore.stations.length} 座 · 设备 {stationStore.devices.length} 台 · 点位 {stationStore.points.length} 个 ·
-          巡检 {patrolStore.patrols.length} 次 · 读数 {patrolStore.readings.length} 条 · 超期未检 {gap.overdueCount} 次
+          巡检 {patrolStore.patrols.length} 次 · 读数 {patrolStore.readings.length} 条 · 待合并 {syncStore.pendingCount()} 条 · 未决冲突 {syncStore.openConflictCount()} 项 · 超期未检 {gap.overdueCount} 次
         </span>
       </footer>
     </div>

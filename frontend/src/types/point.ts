@@ -11,9 +11,17 @@ export interface Point {
   unit: string
   /** 是否关键点：关键点偏差超过 5% 即判严重超标 */
   isCritical: boolean
+  /**
+   * 标准值版本号：每次提交新上下限/关键点标记即 +1。
+   * 读数在录入时快照该版本；之后改版只影响新批次，历史读数不重算、不翻级。
+   */
+  standardRevision: number
   createdAt: number
   updatedAt: number
 }
+
+/** 首个标准版本（新建点位 / v3 迁移回填） */
+export const INITIAL_STANDARD_REVISION = 1
 
 export const POINT_UNITS = ['MPa', '℃', 'ppm', 'kPa', 'm³/h']
 

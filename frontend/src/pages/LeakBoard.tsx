@@ -4,6 +4,7 @@
  * 消费 Leak、Device、Reading；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<AbnormalTag>。
  */
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Button,
   Form,
@@ -23,6 +24,7 @@ import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { useLeakStore } from '@/stores/leakStore'
+import { useSyncStore } from '@/stores/syncStore'
 import {
   EMPTY_LEAK_DRAFT,
   LEAK_RETEST_PASS_PPM,
@@ -36,8 +38,10 @@ import {
 import { deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
 export default function LeakBoard() {
+  const navigate = useNavigate()
   const stationStore = useStationStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
 
   const [form] = Form.useForm<LeakDraft>()
   const [treatForm] = Form.useForm<{ handler: string; measure: string }>()
@@ -162,9 +166,17 @@ export default function LeakBoard() {
 
   const submitRetest = async (): Promise<void> => {
     if (!target) return
+    if (syncStore.isLeakBlocked(target.id)) {
+      Message.error('外检值与处置单冲突未裁决，不能复检闭环；请先到「合并与冲突」中心由负责人裁决')
+      return
+    }
     const values = await retestForm.validate().catch(() => null)
     if (!values) return
-    const passed = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler)
+    const passed = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler).catch((error: unknown) => {
+      Message.error(error instanceof Error ? error.message : '复检提交失败')
+      return null
+    })
+    if (passed === null) return
     if (passed) {
       Message.success(`复检浓度 ${values.retestValuePpm} ppm ≤ ${LEAK_RETEST_PASS_PPM} ppm，判定合格，处置单已闭环`)
     } else {
@@ -221,23 +233,48 @@ export default function LeakBoard() {
     },
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
     {
+      title: '冲突',
+      width: 150,
+      render: (_value, record) => {
+        const conflict = syncStore.openConflictOfLeak(record.id)
+        if (!conflict) {
+          return record.conflictId ? <Tag color="green" size="small">冲突已决</Tag> : <span className="muted">—</span>
+        }
+        return (
+          <Button type="text" size="small" status="danger" onClick={() => navigate('/sync')}>
+            {conflict.type === '外检与处置单冲突' ? '外检冲突未裁决' : '两版值待核查'}
+          </Button>
+        )
+      }
+    },
+    {
       title: '操作',
       width: 240,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="text" size="small" disabled={!LEAK_STATE_FLOW[record.state]} onClick={() => advance(record)}>
-            {LEAK_STATE_FLOW[record.state] === '已处置' ? '填写措施' : LEAK_STATE_FLOW[record.state] === '已复检' ? '录入复检' : '已闭环'}
-          </Button>
-          <Button type="text" size="small" onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm title="确认删除该处置单？" onOk={() => remove(record)}>
-            <Button type="text" size="small" status="danger">
-              删除
+      render: (_value, record) => {
+        const blocked = syncStore.isLeakBlocked(record.id)
+        const nextState = LEAK_STATE_FLOW[record.state]
+        const closing = nextState === '已复检'
+        return (
+          <Space size={4}>
+            <Button
+              type="text"
+              size="small"
+              disabled={!nextState || (closing && blocked)}
+              onClick={() => advance(record)}
+            >
+              {nextState === '已处置' ? '填写措施' : nextState === '已复检' ? (blocked ? '冲突未决禁闭环' : '录入复检') : '已闭环'}
             </Button>
-          </Popconfirm>
-        </Space>
-      )
+            <Button type="text" size="small" onClick={() => openEdit(record)}>
+              编辑
+            </Button>
+            <Popconfirm title="确认删除该处置单？" onOk={() => remove(record)}>
+              <Button type="text" size="small" status="danger">
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        )
+      }
     }
   ]
 
@@ -250,6 +287,7 @@ export default function LeakBoard() {
           <h2 className="page-head__title">泄漏处置单与复检闭环</h2>
           <p className="page-head__desc">
             待处置 → 已处置（填写措施与处置人）→ 已复检（复检浓度 ≤ {LEAK_RETEST_PASS_PPM} ppm 判合格）。
+            外检原值与处置单冲突时保留差异，由负责人在「合并与冲突」中心裁决，未决前不能复检闭环。
           </p>
         </div>
         <div className="page-head__actions">
@@ -271,6 +309,12 @@ export default function LeakBoard() {
         <StatBadge label="待处置" value={stats['待处置']} suffix="张" tone="danger" />
         <StatBadge label="已处置" value={stats['已处置']} suffix="张" tone="warning" />
         <StatBadge label="复检合格" value={leakStore.retestPassCount()} percent={leakStore.closedPercent()} suffix="张" tone="success" />
+        <StatBadge
+          label="冲突未决禁闭环"
+          value={leakStore.leaks.filter((leak) => syncStore.isLeakBlocked(leak.id)).length}
+          suffix="张"
+          tone="danger"
+        />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索设备型号 / 编号 / 处置人" onModelChange={onModelChange} />

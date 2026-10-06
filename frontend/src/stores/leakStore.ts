@@ -5,6 +5,7 @@
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
 import { createId, db, type LeakRow } from '@/utils/db'
+import { useSyncStore } from '@/stores/syncStore'
 import {
   LEAK_RETEST_PASS_PPM,
   retestPassed,
@@ -26,6 +27,8 @@ interface LeakState_ {
   removeLeak: (id: string) => Promise<void>
   advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakState | null>
   submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean>
+  /** 未决外检冲突未裁决前不能复检闭环 */
+  blockedByConflict: (id: string) => boolean
   hasLeakOfDevice: (deviceId: string) => boolean
   createFromAbnormal: (payload: {
     deviceId: string
@@ -33,6 +36,7 @@ interface LeakState_ {
     concentrationPpm: number
     foundTime: string
     measure: string
+    sourceReadingId?: string | null
   }) => Promise<Leak>
   counts: () => Record<LeakState, number>
   closedPercent: () => number
@@ -72,6 +76,8 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       state: draft.state,
       retestValuePpm: Number(draft.retestValuePpm) || 0,
       handler: draft.handler.trim(),
+      sourceReadingId: draft.sourceReadingId ?? null,
+      conflictId: draft.conflictId ?? null,
       createdAt: now,
       updatedAt: now
     }
@@ -95,6 +101,9 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
     if (!leak) return null
     const next: LeakState | null = leak.state === '待处置' ? '已处置' : leak.state === '已处置' ? '已复检' : null
     if (!next) return null
+    if (next === '已复检' && get().blockedByConflict(id)) {
+      throw new Error('外检值与处置单冲突未裁决，不能复检闭环')
+    }
     const patch: Partial<LeakRow> = { state: next, updatedAt: Date.now() }
     if (params?.handler !== undefined) patch.handler = params.handler.trim()
     if (params?.measure !== undefined) patch.measure = params.measure.trim()
@@ -103,6 +112,9 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   },
 
   async submitRetest(id, retestValuePpm, handler) {
+    if (get().blockedByConflict(id)) {
+      throw new Error('外检值与处置单冲突未裁决，不能复检闭环')
+    }
     const value = Number(retestValuePpm) || 0
     await db.leaks.update(id, {
       state: '已复检',
@@ -111,6 +123,10 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       updatedAt: Date.now()
     })
     return retestPassed(value)
+  },
+
+  blockedByConflict(id) {
+    return useSyncStore.getState().isLeakBlocked(id)
   },
 
   hasLeakOfDevice(deviceId) {
@@ -125,7 +141,9 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       measure: payload.measure,
       state: '待处置',
       retestValuePpm: 0,
-      handler: ''
+      handler: '',
+      sourceReadingId: payload.sourceReadingId ?? null,
+      conflictId: null
     })
   },
 

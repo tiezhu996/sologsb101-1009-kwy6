@@ -21,10 +21,13 @@ import type { TableColumnProps } from '@arco-design/web-react'
 import AbnormalTag from '@/components/common/AbnormalTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
+import SourceTag from '@/components/common/SourceTag'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
 import { usePatrolStore, type AbnormalRow } from '@/stores/patrolStore'
 import { useLeakStore } from '@/stores/leakStore'
+import { useSyncStore } from '@/stores/syncStore'
+import { snapshotOfReading } from '@/types/reading'
 import type { AbnormalLevel } from '@/utils/range'
 import { CRITICAL_DEVIATION_PCT, SEVERE_DEVIATION_PCT } from '@/utils/range'
 
@@ -35,6 +38,7 @@ export default function AbnormalBoard() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const syncStore = useSyncStore()
 
   const [stationId, setStationId] = useState('')
   const [levels, setLevels] = useState<AbnormalLevel[]>([])
@@ -90,12 +94,13 @@ export default function AbnormalBoard() {
         foundTime,
         measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
           station ? station.name : ''
-        } 已派发处置单`
+        } 已派发处置单`,
+        sourceReadingId: row.reading.id
       })
       Message.success('已派发泄漏处置单')
       return
     }
-    await patrolStore.saveSingleReading(row.reading.patrolId, point, row.reading.value, '异常已确认并记录')
+    await patrolStore.updateReadingNote(row.reading, '异常已确认并记录')
     Message.success('异常已确认并记录')
   }
 
@@ -110,16 +115,18 @@ export default function AbnormalBoard() {
       const row = rows.find((item) => item.reading.id === key)
       if (!row || !row.point) continue
       if (row.point.unit === 'ppm') {
+        if (row.reading.frozen) continue // 外检原值不重复派单
         await leakStore.createFromAbnormal({
           deviceId: row.point.deviceId,
           stationId: row.point.stationId,
           concentrationPpm: row.reading.value,
           foundTime: row.patrol ? row.patrol.patrolDate || row.patrol.planDate : new Date().toISOString().slice(0, 10),
-          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`
+          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`,
+          sourceReadingId: row.reading.id
         })
         leakCount += 1
       } else {
-        await patrolStore.saveSingleReading(row.reading.patrolId, row.point, row.reading.value, '异常已批量确认')
+        await patrolStore.updateReadingNote(row.reading, '异常已批量确认')
         notedCount += 1
       }
     }
@@ -135,15 +142,25 @@ export default function AbnormalBoard() {
 
   const submitFix = async (): Promise<void> => {
     if (!fixTarget || !fixTarget.point) return
+    if (fixTarget.reading.frozen) {
+      Message.error('外检原值只读，不能修正')
+      return
+    }
     const values = await fixForm.validate().catch(() => null)
     if (!values) return
-    await patrolStore.saveSingleReading(
+    // 修正视为现场重新录入一条读数：按当前点位标准判级，不改动历史快照行
+    const result = await patrolStore.saveSingleReading(
       fixTarget.reading.patrolId,
       fixTarget.point,
       Number(values.value),
-      values.note
+      values.note,
+      '巡检班'
     )
-    Message.success('读数已修正，偏差率与异常级别已重算')
+    if (!result.ok) {
+      Message.error(result.blocked ?? '修正失败')
+      return
+    }
+    Message.success('已按当前标准生成修正读数，历史判级保留不变')
     setFixOpen(false)
   }
 
@@ -174,10 +191,36 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
-      render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+      title: '来源 / 核查',
+      width: 150,
+      render: (_value, record) => (
+        <SourceTag
+          source={record.reading.source}
+          verifyStatus={record.reading.verifyStatus}
+          frozen={record.reading.frozen}
+          size="small"
+        />
+      )
+    },
+    {
+      title: '判级标准（录入时）',
+      width: 190,
+      render: (_value, record) => {
+        if (!record.point) return '—'
+        const snapshot = snapshotOfReading(record.reading, {
+          standardMin: record.point.standardMin,
+          standardMax: record.point.standardMax,
+          isCritical: record.point.isCritical
+        })
+        return (
+          <span>
+            {snapshot.standardMin} ~ {snapshot.standardMax} {record.point.unit}
+            <Tag size="small" style={{ marginLeft: 4 }}>
+              v{record.reading.standardRevision}
+            </Tag>
+          </span>
+        )
+      }
     },
     {
       title: '读数',
@@ -212,25 +255,37 @@ export default function AbnormalBoard() {
     },
     {
       title: '操作',
-      width: 280,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button type="text" size="small" onClick={() => confirm(record)}>
-            {record.point?.unit === 'ppm' ? '派发处置单' : '确认异常'}
-          </Button>
-          <Button type="text" size="small" onClick={() => openFix(record)}>
-            修正读数
-          </Button>
-          <Popconfirm title="确认删除该条误录读数？" onOk={() => removeReading(record)}>
-            <Button type="text" size="small" status="danger">
-              删除
+      width: 300,
+      render: (_value, record) => {
+        const frozen = record.reading.frozen
+        const blocked = frozen
+          ? null
+          : syncStore.openConflictOfReading(record.reading.id)
+        return (
+          <Space size={4} wrap>
+            <Button type="text" size="small" disabled={frozen} onClick={() => confirm(record)}>
+              {record.point?.unit === 'ppm' ? '派发处置单' : '确认异常'}
             </Button>
-          </Popconfirm>
-          <Button type="text" size="small" onClick={() => navigate('/leaks')}>
-            处置台账
-          </Button>
-        </Space>
-      )
+            <Button type="text" size="small" disabled={frozen} onClick={() => openFix(record)}>
+              修正读数
+            </Button>
+            <Popconfirm title="确认删除该条误录读数？" onOk={() => removeReading(record)}>
+              <Button type="text" size="small" status="danger" disabled={frozen}>
+                删除
+              </Button>
+            </Popconfirm>
+            {blocked ? (
+              <Button type="text" size="small" status="warning" onClick={() => navigate('/sync')}>
+                冲突待裁决
+              </Button>
+            ) : (
+              <Button type="text" size="small" onClick={() => navigate('/leaks')}>
+                处置台账
+              </Button>
+            )}
+          </Space>
+        )
+      }
     }
   ]
 

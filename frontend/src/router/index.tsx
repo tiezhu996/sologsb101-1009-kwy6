@@ -13,6 +13,7 @@ const PatrolEntry = lazy(() => import('../pages/PatrolEntry'))
 const AbnormalBoard = lazy(() => import('../pages/AbnormalBoard'))
 const LeakBoard = lazy(() => import('../pages/LeakBoard'))
 const PlanList = lazy(() => import('../pages/PlanList'))
+const SyncCenter = lazy(() => import('../pages/SyncCenter'))
 
 export const ROUTES = {
   stations: '/stations',
@@ -20,7 +21,8 @@ export const ROUTES = {
   patrols: '/patrols',
   abnormal: '/abnormal',
   leaks: '/leaks',
-  plans: '/plans'
+  plans: '/plans',
+  sync: '/sync'
 } as const
 
 function RouteFallback() {
@@ -43,6 +45,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'abnormal', element: withSuspense(<AbnormalBoard />) },
       { path: 'leaks', element: withSuspense(<LeakBoard />) },
       { path: 'plans', element: withSuspense(<PlanList />) },
+      { path: 'sync', element: withSuspense(<SyncCenter />) },
       { path: '*', element: <Navigate to={ROUTES.stations} replace /> }
     ]
   }
